@@ -34,6 +34,17 @@ impl BlockManager {
             .collect::<Vec<_>>();
 
         for block_id in block_ids {
+            // A block whose latest record is older than `time` cannot hold it. Cached blocks are
+            // checked anyway, since their index entry may not have caught up with a write yet.
+            let ends_before = self
+                .block_index
+                .get_block(block_id)
+                .and_then(|block| block.latest_record_time.as_ref())
+                .is_some_and(|latest| ts_to_us(latest) < time);
+            if ends_before && self.block_cache.get_read(&block_id).is_none() {
+                continue;
+            }
+
             let block_ref = self.load_block(block_id).await?;
             if block_ref.read().await?.get_record(time).is_some() {
                 return Ok(block_ref);
@@ -210,7 +221,7 @@ mod tests {
     use super::*;
     use crate::storage::block_manager::test_utils::{block_id, block_manager};
     use crate::storage::block_manager::BlockManager;
-    use crate::storage::proto::Block as BlockProto;
+    use crate::storage::proto::{record, us_to_ts, Block as BlockProto, Record};
     use prost::Message;
     use reduct_base::error::ErrorCode;
     use rstest::rstest;
@@ -351,5 +362,57 @@ mod tests {
             "corrupted blocks remain in the index for quota cleanup"
         );
         assert!(block_manager.is_block_corrupted(block_id));
+    }
+
+    async fn block_with_records(bm: &mut BlockManager, block_id: u64, times: &[u64]) {
+        let block_ref = bm.start_new_block(block_id, 1024).await.unwrap();
+        {
+            let mut block = block_ref.write().await.unwrap();
+            for time in times {
+                block.insert_or_update_record(Record {
+                    timestamp: Some(us_to_ts(time)),
+                    begin: 0,
+                    end: 0,
+                    state: record::State::Finished as i32,
+                    labels: vec![],
+                    content_type: "".to_string(),
+                });
+            }
+        }
+        bm.save_meta_on_disk(block_ref).await.unwrap();
+        bm.block_cache.remove(&block_id);
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_find_missing_record_skips_older_blocks_that_end_before_it(
+        #[future] block_manager: BlockManager,
+    ) {
+        let mut bm = block_manager.await;
+        block_with_records(&mut bm, 1000, &[1000, 1500]).await;
+        block_with_records(&mut bm, 3000, &[3000, 3500]).await;
+        block_with_records(&mut bm, 5000, &[5000]).await;
+
+        // Loading block 1000 would now mark it corrupted.
+        std::fs::write(bm.path_to_desc(1000), b"corrupted").unwrap();
+
+        let block_ref = bm.find_block_with_record(3700).await.unwrap();
+        assert_eq!(block_ref.read().await.unwrap().block_id(), 3000);
+        assert!(block_ref.read().await.unwrap().get_record(3700).is_none());
+        assert!(
+            !bm.is_block_corrupted(1000),
+            "block 1000 must not be loaded"
+        );
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_find_belated_record_in_older_block(#[future] block_manager: BlockManager) {
+        let mut bm = block_manager.await;
+        block_with_records(&mut bm, 1000, &[1000, 3200]).await;
+        block_with_records(&mut bm, 3000, &[3000, 3500]).await;
+
+        let block_ref = bm.find_block_with_record(3200).await.unwrap();
+        assert_eq!(block_ref.read().await.unwrap().block_id(), 1000);
     }
 }
